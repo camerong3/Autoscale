@@ -50,18 +50,30 @@ constexpr size_t MAX_SAMPLES = 6000;        // ~75s at 80Hz (adjust as needed)
 enum class RunState : uint8_t { IDLE = 0, ACTIVE = 1 };
 static RunState g_state = RunState::IDLE;
 
+// Pause event capture while running calibration routines
+static volatile bool g_calInProgress = false;
+
 // IDLE detection
 constexpr uint32_t IDLE_POLL_MS = 200;      // light polling cadence
 constexpr float TRIGGER_KG = 4.00f;         // switch to ACTIVE when abs(weight) crosses this
 constexpr float RELEASE_KG = 3.00f;         // lower threshold to exit ACTIVE (hysteresis)
 
 // ACTIVE termination
-constexpr float HOLD_KG = 0.20f;            // consider "below threshold" when under this
 constexpr uint32_t BELOW_HOLD_MS = 2000;    // need this many ms below HOLD_KG to end ACTIVE
 constexpr uint32_t ACTIVE_MAX_MS = 90000;   // hard cap on ACTIVE session (failsafe, 90s)
+constexpr uint32_t DEBUG_EVERY_N = 32;      // log every N samples during ACTIVE
+
+// ---- Calibration timing/tuning (time-based, not value-detection) ----
+constexpr uint32_t CAL_PLACE_WAIT_MS   = 4000;   // time for user to place mass and settle
+constexpr uint32_t CAL_STABLE_MIN_MS   = 1500;   // minimum stable window we insist on
+constexpr uint16_t CAL_MIN_SAMPLES     = 30;     // min samples in stable window
+constexpr uint16_t CAL_MAX_SAMPLES     = 400;    // cap samples per window (~5s @ 80SPS)
+constexpr float    CAL_MAX_SD_COUNTS   = 600.0f; // stricter noise threshold during cal
 
 static uint32_t session_t0 = 0;             // millis() at session start
 static uint32_t below_start_ms = 0;         // timer for below-threshold during ACTIVE
+// Cooldown period after calibration to prevent immediate re-arming
+static uint32_t g_pauseUntilMs = 0;
 
 // Forward decls
 bool postEventToSupabase(const std::vector<Sample>& buf, const char* scaleId);
@@ -107,6 +119,7 @@ void printHelp() {
   Serial.println(F("  cal1 <g>          - two-point: record point 1 at <g>"));
   Serial.println(F("  cal2 <g>          - two-point: record point 2 at <g>"));
   Serial.println(F("  solve             - solve two-point factor from cal1/cal2"));
+  Serial.println(F("  resetcal          - reset calibration to default factor"));
   Serial.println(F("Units: readings print in kilograms (kg)."));
 }
 
@@ -119,32 +132,47 @@ void cmdTare() {
 void cmdCalibrate(float knownMassGrams) {
   if (knownMassGrams <= 0) {
     Serial.println(F("[CAL] Mass must be > 0."));
+    g_pauseUntilMs = millis() + 3000; // 3s cooldown
     return;
   }
+  // Pause state machine during calibration
+  g_calInProgress = true;
+  g_state = RunState::IDLE;
+  below_start_ms = 0;
+  g_buf.clear();
   Serial.println(F("[CAL] Empty platform then taring..."));
   scale.tare(25);
-  Serial.println(F("[CAL] Place the known mass and keep it still…"));
-  delay(2000);
+  Serial.print(F("[CAL] Place the known mass (")); Serial.print(knownMassGrams, 0); Serial.println(F(" g) and keep still…"));
+  delay(CAL_PLACE_WAIT_MS); // time-based waiting to avoid dependency on prior calibration
 
   if (!scale.is_ready()) {
     Serial.println(F("[CAL] HX711 not ready; try again."));
+    g_calInProgress = false; // resume normal operation
+    g_pauseUntilMs = millis() + 3000; // 3s cooldown
     return;
   }
-  // Use stability-gated raw average to reduce noise/motion error
-  long raw = readStableRaw(/*minSamples=*/20, /*maxSamples=*/100, /*maxStdDev=*/800.0f, /*minDurationMs=*/1200);
+  // Stricter stability window for calibration
+  long raw = readStableRaw(/*minSamples=*/CAL_MIN_SAMPLES,
+                           /*maxSamples=*/CAL_MAX_SAMPLES,
+                           /*maxStdDev=*/CAL_MAX_SD_COUNTS,
+                           /*minDurationMs=*/CAL_STABLE_MIN_MS);
   float newFactor = raw / knownMassGrams; // counts per gram
   scale.set_scale(newFactor);
   currentCalFactor = newFactor;
   saveCal(newFactor);
 
-  float check_g = scale.get_units(20);
+  float check_g = scale.get_units(30);
+  float check_kg = check_g / 1000.0f;
   Serial.print(F("[CAL] raw=")); Serial.print(raw);
-  Serial.print(F(" counts @ mass=")); Serial.print(knownMassGrams, 2); Serial.println(F(" g"));
-  Serial.print(F("[CAL] New factor (counts/gram): "));
-  Serial.println(currentCalFactor, 6);
-  Serial.print(F("[CAL] Measured now: "));
-  Serial.print(check_g / 1000.0f, 3); Serial.println(F(" kg (should be close)"));
+  Serial.print(F(" counts @ mass=")); Serial.print(knownMassGrams, 1); Serial.println(F(" g"));
+  Serial.print(F("[CAL] New factor (counts/gram): ")); Serial.println(currentCalFactor, 6);
+  Serial.print(F("[CAL] Measured now: ")); Serial.print(check_kg, 3); Serial.println(F(" kg"));
+  float expect_kg = knownMassGrams / 1000.0f;
+  float pct_err = (expect_kg != 0.0f) ? (100.0f * (check_kg - expect_kg) / expect_kg) : 0.0f;
+  Serial.print(F("[CAL] Error vs target: ")); Serial.print(pct_err, 2); Serial.println(F(" %"));
   Serial.println(F("[CAL] Saved to NVS. Persists across reboots."));
+  g_calInProgress = false;
+  g_pauseUntilMs = millis() + 3000; // 3s cooldown after calibration
 }
 
 float computeStdDev(const long* arr, size_t n, float mean) {
@@ -202,24 +230,38 @@ bool loadCal(float &factorOut) {
 
 void cmdCal1(float grams) {
   if (grams <= 0) { Serial.println(F("[CAL1] Mass must be > 0.")); return; }
-  Serial.println(F("[CAL1] Ensure tare, place mass and keep still…"));
-  delay(1500);
-  calP1_raw = readStableRaw(20, 120, 800.0f, 1200);
+  // Pause state machine during calibration point capture
+  g_calInProgress = true;
+  g_state = RunState::IDLE;
+  below_start_ms = 0;
+  g_buf.clear();
+  Serial.print(F("[CAL1] Place mass (")); Serial.print(grams, 0); Serial.println(F(" g) and keep still…"));
+  delay(CAL_PLACE_WAIT_MS);
+  calP1_raw = readStableRaw(CAL_MIN_SAMPLES, CAL_MAX_SAMPLES, CAL_MAX_SD_COUNTS, CAL_STABLE_MIN_MS);
   calP1_mass_g = grams;
   calHasP1 = true;
   Serial.print(F("[CAL1] raw=")); Serial.print(calP1_raw);
   Serial.print(F(" @ ")); Serial.print(calP1_mass_g, 2); Serial.println(F(" g"));
+  g_calInProgress = false;
+  g_pauseUntilMs = millis() + 3000; // 3s cooldown
 }
 
 void cmdCal2(float grams) {
   if (grams <= 0) { Serial.println(F("[CAL2] Mass must be > 0.")); return; }
-  Serial.println(F("[CAL2] Place second mass and keep still…"));
-  delay(1500);
-  calP2_raw = readStableRaw(20, 120, 800.0f, 1200);
+  // Pause state machine during calibration point capture
+  g_calInProgress = true;
+  g_state = RunState::IDLE;
+  below_start_ms = 0;
+  g_buf.clear();
+  Serial.print(F("[CAL2] Place second mass (")); Serial.print(grams, 0); Serial.println(F(" g) and keep still…"));
+  delay(CAL_PLACE_WAIT_MS);
+  calP2_raw = readStableRaw(CAL_MIN_SAMPLES, CAL_MAX_SAMPLES, CAL_MAX_SD_COUNTS, CAL_STABLE_MIN_MS);
   calP2_mass_g = grams;
   calHasP2 = true;
   Serial.print(F("[CAL2] raw=")); Serial.print(calP2_raw);
   Serial.print(F(" @ ")); Serial.print(calP2_mass_g, 2); Serial.println(F(" g"));
+  g_calInProgress = false;
+  g_pauseUntilMs = millis() + 3000; // 3s cooldown
 }
 
 void cmdSolve2pt() {
@@ -233,6 +275,10 @@ void cmdSolve2pt() {
     Serial.println(F("[SOLVE] Masses must be different."));
     return;
   }
+  g_calInProgress = true;
+  g_state = RunState::IDLE;
+  below_start_ms = 0;
+  g_buf.clear();
   float newFactor = (float)dr / dm; // counts per gram
   scale.set_scale(newFactor);
   currentCalFactor = newFactor;
@@ -242,11 +288,38 @@ void cmdSolve2pt() {
   Serial.print(dr); Serial.print(F(" / ")); Serial.print(dm, 3);
   Serial.print(F(" = ")); Serial.println(currentCalFactor, 6);
 
-  float verify_g = scale.get_units(20);
-  Serial.print(F("[SOLVE] Live reading: "));
-  Serial.print(verify_g / 1000.0f, 3); Serial.println(F(" kg"));
+  float verify_g = scale.get_units(30);
+  float verify_kg = verify_g / 1000.0f;
+  Serial.print(F("[SOLVE] Live reading: ")); Serial.print(verify_kg, 3); Serial.println(F(" kg"));
+  if (calHasP1) {
+    float tgt1_kg = calP1_mass_g / 1000.0f;
+    float err1 = (tgt1_kg != 0.0f) ? (100.0f * (verify_kg - tgt1_kg) / tgt1_kg) : 0.0f;
+    Serial.print(F("[SOLVE] Check vs P1 (")); Serial.print(tgt1_kg, 3); Serial.print(F(" kg): "));
+    Serial.print(err1, 2); Serial.println(F(" %"));
+  }
+  if (calHasP2) {
+    float tgt2_kg = calP2_mass_g / 1000.0f;
+    float err2 = (tgt2_kg != 0.0f) ? (100.0f * (verify_kg - tgt2_kg) / tgt2_kg) : 0.0f;
+    Serial.print(F("[SOLVE] Check vs P2 (")); Serial.print(tgt2_kg, 3); Serial.print(F(" kg): "));
+    Serial.print(err2, 2); Serial.println(F(" %"));
+  }
 
+  g_calInProgress = false;
+  g_pauseUntilMs = millis() + 3000; // 3s cooldown
   calHasP1 = calHasP2 = false; // reset
+}
+
+void cmdResetCal() {
+  Serial.println(F("[CAL] Resetting calibration to default..."));
+  prefs.begin(PREF_NS, false);
+  prefs.remove(PREF_CAL_KEY);   // remove saved factor
+  prefs.end();
+
+  currentCalFactor = CAL_FACTOR;   // use the compile-time default
+  scale.set_scale(currentCalFactor);
+
+  Serial.print(F("[CAL] Now using default factor: "));
+  Serial.println(currentCalFactor, 6);
 }
 
 void startConfigPortal(WiFiManager& wm, bool blocking = true) {
@@ -394,6 +467,8 @@ void loop() {
           cmdSolve2pt();
         } else if (serialLine.equalsIgnoreCase("cal")) {
           Serial.println(F("[CMD] Usage: cal <grams> (e.g., cal 500)"));
+        } else if (serialLine.equalsIgnoreCase("resetcal")) {
+          cmdResetCal();
         } else {
           Serial.print(F("[CMD] Unknown: ")); Serial.println(serialLine);
           printHelp();
@@ -408,72 +483,75 @@ void loop() {
   // ---- State machine for event capture ----
   static uint32_t lastIdlePoll = 0;
 
-  switch (g_state) {
-    case RunState::IDLE: {
-      if (millis() - lastIdlePoll >= IDLE_POLL_MS) {
-        lastIdlePoll = millis();
-        if (scale.is_ready()) {
-          // light average for stability
-          float g_read = scale.get_units(3); // grams
-          float kg = g_read / 1000.0f;
-          if (fabs(kg) < 0.005f) kg = 0.0f; // ~5 g deadband
-          Serial.print(F("[IDLE] kg=")); Serial.println(kg, 3);
+  bool inCooldown = (int32_t)(g_pauseUntilMs - millis()) > 0;
+  if (g_calInProgress || inCooldown) {
+    // Heartbeat while paused
+    static uint32_t lastMsg = 0;
+    if (millis() - lastMsg >= 1000) {
+      Serial.println(F("[STATE] Calibration/cooldown in progress - capture paused"));
+      lastMsg = millis();
+    }
+  } else {
+    switch (g_state) {
+      case RunState::IDLE: {
+        if (millis() - lastIdlePoll >= IDLE_POLL_MS) {
+          lastIdlePoll = millis();
+          if (scale.is_ready()) {
+            float g_read = scale.get_units(3); // grams
+            float kg = g_read / 1000.0f;
+            if (fabs(kg) < 0.005f) kg = 0.0f; // ~5 g deadband
+            Serial.print(F("[IDLE] kg=")); Serial.println(kg, 3);
 
-          if (fabs(kg) >= TRIGGER_KG) {
-            // Start ACTIVE session
-            g_buf.clear();
-            session_t0 = millis();
-            below_start_ms = 0;
-            g_state = RunState::ACTIVE;
-            Serial.println(F("[STATE] -> ACTIVE"));
+            if (fabs(kg) >= TRIGGER_KG) {
+              g_buf.clear();
+              session_t0 = millis();
+              below_start_ms = 0;
+              g_state = RunState::ACTIVE;
+              Serial.println(F("[STATE] -> ACTIVE"));
+            }
           }
         }
+        break;
       }
-      break;
-    }
 
-    case RunState::ACTIVE: {
-      // Read as fast as HX711 is ready; this hits ~10 or ~80 Hz depending on RATE pin wiring
-      if (scale.is_ready()) {
-        float g_read = scale.get_units(1); // grams, single sample for max rate
-        float kg = g_read / 1000.0f;
-        uint32_t t_rel = millis() - session_t0;
-        if (fabs(kg) < 0.005f) kg = 0.0f;
-        // Periodic debug print every 16 samples
-        static uint32_t dbgCount = 0;
-        if ((dbgCount++ & 0x0F) == 0) {
-          Serial.print(F("[ACTIVE] t(ms)=")); Serial.print(t_rel);
-          Serial.print(F(" kg=")); Serial.println(kg, 3);
-        }
-        if (g_buf.size() < MAX_SAMPLES) {
-          g_buf.push_back({t_rel, kg});
-        }
+      case RunState::ACTIVE: {
+        if (scale.is_ready()) {
+          float g_read = scale.get_units(1); // grams
+          float kg = g_read / 1000.0f;
+          uint32_t t_rel = millis() - session_t0;
+          if (fabs(kg) < 0.005f) kg = 0.0f;
+          static uint32_t dbgCount = 0;
+          if ((dbgCount++ % DEBUG_EVERY_N) == 0) {
+            Serial.print(F("[ACTIVE] t(ms)=")); Serial.print(t_rel);
+            Serial.print(F(" kg=")); Serial.println(kg, 3);
+          }
+          if (g_buf.size() < MAX_SAMPLES) {
+            g_buf.push_back({t_rel, kg});
+          }
 
-        // End condition: sustained below RELEASE_KG (hysteresis lower than TRIGGER_KG)
-        if (fabs(kg) < RELEASE_KG) {
-          if (below_start_ms == 0) below_start_ms = millis();
-          else if (millis() - below_start_ms >= BELOW_HOLD_MS) {
-            // End session by hysteresis
-            Serial.print(F("[ACTIVE] ending (hysteresis); samples=")); Serial.println(g_buf.size());
+          if (fabs(kg) < RELEASE_KG) {
+            if (below_start_ms == 0) below_start_ms = millis();
+            else if (millis() - below_start_ms >= BELOW_HOLD_MS) {
+              Serial.print(F("[ACTIVE] ending (hysteresis); samples=")); Serial.println(g_buf.size());
+              bool ok = postEventToSupabase(g_buf, SCALE_ID);
+              Serial.println(ok ? F("[POST] upload OK") : F("[POST] upload FAILED"));
+              g_state = RunState::IDLE;
+              Serial.println(F("[STATE] -> IDLE"));
+            }
+          } else {
+            below_start_ms = 0;
+          }
+
+          if (millis() - session_t0 >= ACTIVE_MAX_MS) {
+            Serial.print(F("[ACTIVE] ending (timeout); samples=")); Serial.println(g_buf.size());
             bool ok = postEventToSupabase(g_buf, SCALE_ID);
             Serial.println(ok ? F("[POST] upload OK") : F("[POST] upload FAILED"));
             g_state = RunState::IDLE;
             Serial.println(F("[STATE] -> IDLE"));
           }
-        } else {
-          below_start_ms = 0; // reset timer if we pop back above threshold
         }
-
-        // Failsafe: hard cap on ACTIVE duration
-        if (millis() - session_t0 >= ACTIVE_MAX_MS) {
-          Serial.print(F("[ACTIVE] ending (timeout); samples=")); Serial.println(g_buf.size());
-          bool ok = postEventToSupabase(g_buf, SCALE_ID);
-          Serial.println(ok ? F("[POST] upload OK") : F("[POST] upload FAILED"));
-          g_state = RunState::IDLE;
-          Serial.println(F("[STATE] -> IDLE"));
-        }
+        break;
       }
-      break;
     }
   }
 }
