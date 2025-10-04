@@ -24,8 +24,8 @@ WiFiManager wm;  // Global so we can open the portal from loop()
 
 // HX711 load cell setup
 // Wiring per project context: DOUT -> GPIO16, SCK -> GPIO4
-const int HX711_DOUT = 16;   // LOADCELL_DOUT_PIN
-const int HX711_SCK  = 4;    // LOADCELL_SCK_PIN
+const int HX711_DOUT = 19;   // LOADCELL_DOUT_PIN
+const int HX711_SCK  = 18;    // LOADCELL_SCK_PIN
 const float CAL_FACTOR = 9863.23333f; // calibration factor (project-specific)
 
 HX711 scale;                 // HX711 instance
@@ -63,13 +63,6 @@ constexpr uint32_t BELOW_HOLD_MS = 2000;    // need this many ms below HOLD_KG t
 constexpr uint32_t ACTIVE_MAX_MS = 90000;   // hard cap on ACTIVE session (failsafe, 90s)
 constexpr uint32_t DEBUG_EVERY_N = 32;      // log every N samples during ACTIVE
 
-// ---- Calibration timing/tuning (time-based, not value-detection) ----
-constexpr uint32_t CAL_PLACE_WAIT_MS   = 4000;   // time for user to place mass and settle
-constexpr uint32_t CAL_STABLE_MIN_MS   = 1500;   // minimum stable window we insist on
-constexpr uint16_t CAL_MIN_SAMPLES     = 30;     // min samples in stable window
-constexpr uint16_t CAL_MAX_SAMPLES     = 400;    // cap samples per window (~5s @ 80SPS)
-constexpr float    CAL_MAX_SD_COUNTS   = 600.0f; // stricter noise threshold during cal
-
 static uint32_t session_t0 = 0;             // millis() at session start
 static uint32_t below_start_ms = 0;         // timer for below-threshold during ACTIVE
 // Cooldown period after calibration to prevent immediate re-arming
@@ -96,10 +89,79 @@ long readStableRaw(uint16_t minSamples, uint16_t maxSamples, float maxStdDevCoun
 float computeStdDev(const long* arr, size_t n, float mean);
 void saveCal(float factor);
 bool loadCal(float &factorOut);
+// Gram-based stability helpers
+bool waitStableZeroG(float tol_g, uint32_t stable_ms, uint32_t timeout_ms);
+bool waitStableAnyG(float tol_g, uint32_t stable_ms, uint32_t timeout_ms, float &avg_g_out);
+// Forward declare raw sampler used inside plateau detector
+uint16_t sampleRawFor(uint32_t window_ms, uint16_t max_samples, long &mean_out, float &sd_out);
+// RAW-based stability + plateau detector for calibration mass placement
+// Waits for low noise in raw counts AND a short plateau (two stable windows with near-identical means)
+bool waitStableRawPlateau(uint32_t window_ms,
+                          float maxSdCounts,
+                          uint32_t stable_ms,
+                          uint32_t timeout_ms,
+                          long &mean_raw_out) {
+  uint32_t t0 = millis();
+  uint32_t stableStart = 0;
+  bool havePrevStable = false;
+  long prevMean = 0;
+  uint32_t prevTs = 0;
+  uint32_t lastLog = 0;
+
+  while ((int32_t)(millis() - t0) < (int32_t)timeout_ms) {
+    long mean_raw = 0; float sd = 0.0f;
+    uint16_t n = sampleRawFor(window_ms, /*max_samples=*/120, mean_raw, sd);
+
+    bool stable = (n > 0) && (sd <= maxSdCounts);
+    if (stable) {
+      if (stableStart == 0) stableStart = millis();
+      // Plateau check: require two stable windows separated by >= window_ms where means are close
+      if (!havePrevStable) { prevMean = mean_raw; prevTs = millis(); havePrevStable = true; }
+      else if (millis() - prevTs >= window_ms) {
+        // Allow tolerance relative to signal magnitude plus a small absolute floor
+        long tol = (long)lroundf(fabsf((float)mean_raw) * 0.010f) + 2000; // 1% + 2000 counts
+        if (labs(mean_raw - prevMean) <= tol && (millis() - stableStart) >= stable_ms) {
+          mean_raw_out = mean_raw;
+          return true;
+        }
+        // update reference for the next comparison
+        prevMean = mean_raw; prevTs = millis();
+      }
+    } else {
+      stableStart = 0;
+      havePrevStable = false;
+    }
+
+    if (millis() - lastLog >= 500) {
+      Serial.print(F("[CAL] RAW window: n=")); Serial.print(n);
+      Serial.print(F(" mean=")); Serial.print(mean_raw);
+      Serial.print(F(" cnt sd=")); Serial.println(sd, 1);
+      lastLog = millis();
+    }
+  }
+  Serial.println(F("[CAL] Timeout waiting for stable plateau."));
+  return false;
+}
+// Time-window samplers (collect at whatever rate HX711 produces during the window)
+uint16_t sampleGramsFor(uint32_t window_ms, uint16_t max_samples, float &mean_out, float &sd_out);
+uint16_t sampleRawFor(uint32_t window_ms, uint16_t max_samples, long &mean_out, float &sd_out);
+// Safe tare helper
+bool tareWithTimeout(uint16_t samples, uint32_t per_read_timeout_ms, uint32_t overall_timeout_ms);
 
 // (obsolete) Non-blocking read cadence used by legacy loop printer; state machine below supersedes this
 constexpr uint32_t SCALE_READ_INTERVAL_MS = 100; // adjust as needed
 uint32_t lastScaleReadMs = 0;
+
+// ---- Calibration stability (grams-based) ----
+constexpr float    CAL_STABLE_TOL_G   = 2.0f;   // ± tolerance for stability checks (1–2 g typical)
+constexpr uint32_t CAL_STABLE_MS      = 1500;   // must remain stable this long
+constexpr uint32_t CAL_TIMEOUT_MS     = 60000;  // overall wait timeout per step
+
+// ---- Calibration raw-window tuning (counts-based) ----
+constexpr uint16_t CAL_MIN_SAMPLES   = 30;      // minimum samples in stable RAW window
+constexpr uint16_t CAL_MAX_SAMPLES   = 400;     // cap samples collected during RAW window
+constexpr float    CAL_MAX_SD_COUNTS = 5000.0f;  // standard deviation threshold (counts)
+constexpr uint32_t CAL_STABLE_MIN_MS = 1500;    // minimum duration for RAW window
 
 // --- Calibration helpers ---
 float currentCalFactor = CAL_FACTOR; // track live factor
@@ -125,7 +187,10 @@ void printHelp() {
 
 void cmdTare() {
   Serial.println(F("[HX711] Taring..."));
-  scale.tare(20);
+  if (!tareWithTimeout(25, /*per_read_timeout_ms=*/500, /*overall_timeout_ms=*/12000)) {
+    Serial.println(F("[HX711] Tare aborted (timeout)."));
+    return;
+  }
   Serial.println(F("[HX711] Tare done."));
 }
 
@@ -140,18 +205,36 @@ void cmdCalibrate(float knownMassGrams) {
   g_state = RunState::IDLE;
   below_start_ms = 0;
   g_buf.clear();
-  Serial.println(F("[CAL] Empty platform then taring..."));
-  scale.tare(25);
-  Serial.print(F("[CAL] Place the known mass (")); Serial.print(knownMassGrams, 0); Serial.println(F(" g) and keep still…"));
-  delay(CAL_PLACE_WAIT_MS); // time-based waiting to avoid dependency on prior calibration
 
-  if (!scale.is_ready()) {
-    Serial.println(F("[CAL] HX711 not ready; try again."));
-    g_calInProgress = false; // resume normal operation
-    g_pauseUntilMs = millis() + 3000; // 3s cooldown
-    return;
+  // 1) Tare
+  Serial.println(F("[CAL] Empty platform then taring..."));
+  if (!tareWithTimeout(25, /*per_read_timeout_ms=*/500, /*overall_timeout_ms=*/12000)) {
+    g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
   }
-  // Stricter stability window for calibration
+  // Refine zero offset using a short stable raw window, independent of scale factor
+  {
+    long zeroRaw = readStableRaw(/*minSamples=*/20,
+                                 /*maxSamples=*/120,
+                                 /*maxStdDev=*/1200.0f,
+                                 /*minDurationMs=*/800);
+    scale.set_offset(zeroRaw);
+    Serial.print(F("[CAL] Refined zero offset=")); Serial.println(zeroRaw);
+  }
+  // 2) Ensure we read ~0 g after tare
+  if (!waitStableZeroG(CAL_STABLE_TOL_G, CAL_STABLE_MS, CAL_TIMEOUT_MS)) {
+    g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
+  }
+
+  // 3) Prompt for mass and wait for stability at the **plateau** (RAW-based)
+  Serial.print(F("[CAL] Place the known mass (")); Serial.print(knownMassGrams, 0); Serial.println(F(" g) and keep still…"));
+  delay(5000); // give user time to place mass
+  Serial.println(F("[CAL] Waiting for stable plateau..."));
+  long plateauMean = 0;
+  if (!waitStableRawPlateau(/*window_ms=*/1200, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/2000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateauMean)) {
+    g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
+  }
+
+  // 4) Capture stable RAW counts window (strict) and compute factor
   long raw = readStableRaw(/*minSamples=*/CAL_MIN_SAMPLES,
                            /*maxSamples=*/CAL_MAX_SAMPLES,
                            /*maxStdDev=*/CAL_MAX_SD_COUNTS,
@@ -161,6 +244,7 @@ void cmdCalibrate(float knownMassGrams) {
   currentCalFactor = newFactor;
   saveCal(newFactor);
 
+  // 5) Verify
   float check_g = scale.get_units(30);
   float check_kg = check_g / 1000.0f;
   Serial.print(F("[CAL] raw=")); Serial.print(raw);
@@ -173,6 +257,114 @@ void cmdCalibrate(float knownMassGrams) {
   Serial.println(F("[CAL] Saved to NVS. Persists across reboots."));
   g_calInProgress = false;
   g_pauseUntilMs = millis() + 3000; // 3s cooldown after calibration
+}
+// ---- Time-window samplers ----
+// Collect grams over a fixed time window; returns number of samples and outputs mean/sd
+uint16_t sampleGramsFor(uint32_t window_ms, uint16_t max_samples, float &mean_out, float &sd_out) {
+  if (max_samples == 0) max_samples = 1;
+  static float buf[256];
+  if (max_samples > 256) max_samples = 256;
+  uint16_t n = 0;
+  uint32_t t0 = millis();
+  while ((int32_t)(millis() - t0) < (int32_t)window_ms) {
+    if (scale.wait_ready_timeout(10)) {
+      float g = scale.get_units(1); // 1-sample convert to grams using current factor
+      if (n < max_samples) buf[n++] = g;
+    } else {
+      // no sample in this 10ms slice; let WiFi/Serial run
+      delay(1);
+      yield();
+    }
+  }
+  if (n == 0) { mean_out = 0; sd_out = INFINITY; return 0; }
+  double sum = 0; for (uint16_t i=0;i<n;i++) sum += buf[i];
+  mean_out = (float)(sum / n);
+  double acc = 0; for (uint16_t i=0;i<n;i++) { double d = buf[i]-mean_out; acc += d*d; }
+  sd_out = (n>1) ? (float)sqrt(acc/(n-1)) : 0.0f;
+  return n;
+}
+
+// Collect raw counts over a fixed time window; returns number of samples and outputs mean/sd
+uint16_t sampleRawFor(uint32_t window_ms, uint16_t max_samples, long &mean_out, float &sd_out) {
+  static long buf[256];
+  if (max_samples == 0) max_samples = 1;
+  if (max_samples > 256) max_samples = 256;
+  uint16_t n = 0;
+  uint32_t t0 = millis();
+  while ((int32_t)(millis() - t0) < (int32_t)window_ms) {
+    if (scale.wait_ready_timeout(10)) {
+      long r = scale.read();
+      if (n < max_samples) buf[n++] = r;
+    } else {
+      delay(1);
+      yield();
+    }
+  }
+  if (n == 0) { mean_out = 0; sd_out = INFINITY; return 0; }
+  double sum = 0; for (uint16_t i=0;i<n;i++) sum += (double)buf[i];
+  double mean = sum / n;
+  double acc = 0; for (uint16_t i=0;i<n;i++){ double d = (double)buf[i]-mean; acc += d*d; }
+  mean_out = (long)lround(mean);
+  sd_out = (n>1) ? (float)sqrt(acc/(n-1)) : 0.0f;
+  return n;
+}
+
+// Wait for stable zero using RAW counts only (independent of scale factor)
+bool waitStableZeroG(float /*tol_g*/, uint32_t stable_ms, uint32_t timeout_ms) {
+  // RAW-based zero stability: ignore grams entirely so saved/incorrect factors don't block zeroing
+  uint32_t t0 = millis();
+  uint32_t inwin = 0;
+  uint32_t lastLog = 0;
+  while ((int32_t)(millis() - t0) < (int32_t)timeout_ms) {
+    long mean_raw = 0; float sd_counts = 0.0f;
+    uint16_t n = sampleRawFor(/*window_ms=*/900, /*max_samples=*/140, mean_raw, sd_counts);
+
+    // Accept stability based on low RAW noise only
+    bool stable = (n > 0) && (sd_counts <= CAL_MAX_SD_COUNTS);
+    if (stable) {
+      if (inwin == 0) inwin = millis();
+      if (millis() - inwin >= stable_ms) return true;
+    } else {
+      inwin = 0;
+    }
+
+    if (millis() - lastLog >= 500) {
+      Serial.print(F("[CAL] Zero RAW window: n=")); Serial.print(n);
+      Serial.print(F(" mean=")); Serial.print(mean_raw);
+      Serial.print(F(" cnt sd=")); Serial.println(sd_counts, 1);
+      lastLog = millis();
+    }
+  }
+  Serial.println(F("[CAL] Timeout waiting for stable zero (RAW)."));
+  return false;
+}
+
+// Wait until readings are stable within ±tol_g for stable_ms; return average grams.
+bool waitStableAnyG(float tol_g, uint32_t stable_ms, uint32_t timeout_ms, float &avg_g_out) {
+  uint32_t t0 = millis();
+  uint32_t stableStart = 0;
+  uint32_t lastLog = 0;
+  while ((int32_t)(millis() - t0) < (int32_t)timeout_ms) {
+    float mean_g = 0, sd_g = 0;
+    uint16_t n = sampleGramsFor(/*window_ms=*/300, /*max_samples=*/60, mean_g, sd_g);
+
+    bool within = (n > 0) && (sd_g <= tol_g);
+    if (within) {
+      if (stableStart == 0) stableStart = millis();
+      if (millis() - stableStart >= stable_ms) { avg_g_out = mean_g; return true; }
+    } else {
+      stableStart = 0;
+    }
+
+    if (millis() - lastLog >= 500) {
+      Serial.print(F("[CAL] Window: n=")); Serial.print(n);
+      Serial.print(F(" mean=")); Serial.print(mean_g, 2);
+      Serial.print(F(" g sd=")); Serial.print(sd_g, 2); Serial.println(F(" g"));
+      lastLog = millis();
+    }
+  }
+  Serial.println(F("[CAL] Timeout waiting for stable mass."));
+  return false;
 }
 
 float computeStdDev(const long* arr, size_t n, float mean) {
@@ -194,7 +386,7 @@ long readStableRaw(uint16_t minSamples, uint16_t maxSamples, float maxStdDevCoun
   uint32_t start = millis();
   while (n < maxSamples) {
     while (!scale.is_ready()) { delay(1); }
-    buf[n++] = scale.get_value(1);
+    buf[n++] = scale.read();
 
     uint32_t elapsed = millis() - start;
     if (n >= minSamples && elapsed >= minDurationMs) {
@@ -235,13 +427,35 @@ void cmdCal1(float grams) {
   g_state = RunState::IDLE;
   below_start_ms = 0;
   g_buf.clear();
+
+  // Tare and verify zero
+  Serial.println(F("[CAL1] Taring..."));
+  if (!tareWithTimeout(25, /*per_read_timeout_ms=*/500, /*overall_timeout_ms=*/12000)) {
+    g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
+  }
+  // Refine zero offset (raw) before stability check
+  {
+    long zeroRaw = readStableRaw(20, 120, 1200.0f, 800);
+    scale.set_offset(zeroRaw);
+    Serial.print(F("[CAL1] Refined zero offset=")); Serial.println(zeroRaw);
+  }
+  if (!waitStableZeroG(CAL_STABLE_TOL_G, CAL_STABLE_MS, CAL_TIMEOUT_MS)) {
+    g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
+  }
+
+  // Prompt and wait for stable plateau (RAW-based)
   Serial.print(F("[CAL1] Place mass (")); Serial.print(grams, 0); Serial.println(F(" g) and keep still…"));
-  delay(CAL_PLACE_WAIT_MS);
+  long plateau1 = 0;
+  if (!waitStableRawPlateau(/*window_ms=*/1200, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/2000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateau1)) {
+    g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
+  }
+
+  // Capture RAW for better slope calculation
   calP1_raw = readStableRaw(CAL_MIN_SAMPLES, CAL_MAX_SAMPLES, CAL_MAX_SD_COUNTS, CAL_STABLE_MIN_MS);
   calP1_mass_g = grams;
   calHasP1 = true;
   Serial.print(F("[CAL1] raw=")); Serial.print(calP1_raw);
-  Serial.print(F(" @ ")); Serial.print(calP1_mass_g, 2); Serial.println(F(" g"));
+  Serial.print(F(" @ ")); Serial.print(calP1_mass_g, 1); Serial.println(F(" g"));
   g_calInProgress = false;
   g_pauseUntilMs = millis() + 3000; // 3s cooldown
 }
@@ -253,15 +467,106 @@ void cmdCal2(float grams) {
   g_state = RunState::IDLE;
   below_start_ms = 0;
   g_buf.clear();
+
+  // Tare and verify zero
+  Serial.println(F("[CAL2] Taring..."));
+  if (!tareWithTimeout(25, /*per_read_timeout_ms=*/500, /*overall_timeout_ms=*/12000)) {
+    g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
+  }
+  // Refine zero offset (raw) before stability check
+  {
+    long zeroRaw = readStableRaw(20, 120, 1200.0f, 800);
+    scale.set_offset(zeroRaw);
+    Serial.print(F("[CAL2] Refined zero offset=")); Serial.println(zeroRaw);
+  }
+  if (!waitStableZeroG(CAL_STABLE_TOL_G, CAL_STABLE_MS, CAL_TIMEOUT_MS)) {
+    g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
+  }
+
+  // Prompt and wait for stable plateau (RAW-based)
   Serial.print(F("[CAL2] Place second mass (")); Serial.print(grams, 0); Serial.println(F(" g) and keep still…"));
-  delay(CAL_PLACE_WAIT_MS);
+  long plateau2 = 0;
+  if (!waitStableRawPlateau(/*window_ms=*/1200, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/2000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateau2)) {
+    g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
+  }
+
+  // Capture RAW for better slope calculation
   calP2_raw = readStableRaw(CAL_MIN_SAMPLES, CAL_MAX_SAMPLES, CAL_MAX_SD_COUNTS, CAL_STABLE_MIN_MS);
   calP2_mass_g = grams;
   calHasP2 = true;
   Serial.print(F("[CAL2] raw=")); Serial.print(calP2_raw);
-  Serial.print(F(" @ ")); Serial.print(calP2_mass_g, 2); Serial.println(F(" g"));
+  Serial.print(F(" @ ")); Serial.print(calP2_mass_g, 1); Serial.println(F(" g"));
   g_calInProgress = false;
   g_pauseUntilMs = millis() + 3000; // 3s cooldown
+}
+// Perform a tare by averaging N raw reads, with per-read and overall timeouts.
+bool tareWithTimeout(uint16_t samples, uint32_t per_read_timeout_ms, uint32_t overall_timeout_ms) {
+  if (samples == 0) samples = 1;
+
+  // Ensure SCK is driven LOW before we start (HX711 requires PD_SCK low during conversions)
+  pinMode(HX711_SCK, OUTPUT);
+  digitalWrite(HX711_SCK, LOW);
+
+  uint32_t t0 = millis();
+  uint16_t got = 0;
+  long long sum = 0; // prevent overflow
+  bool recoveryTried = false;
+
+  // If startup is sluggish, grab a short raw window (time-boxed) to seed the offset
+  if (!scale.is_ready()) {
+    long seedMean = 0; float seedSd = 0;
+    uint16_t seedN = sampleRawFor(/*window_ms=*/300, /*max_samples=*/30, seedMean, seedSd);
+    if (seedN > 0) { sum += seedMean; ++got; }
+  }
+
+  while (got < samples && (int32_t)(millis() - t0) < (int32_t)overall_timeout_ms) {
+    // Wait for data-ready up to per_read_timeout_ms in small slices with yield
+    uint32_t w0 = millis();
+    bool ready = false;
+    while ((int32_t)(millis() - w0) < (int32_t)per_read_timeout_ms) {
+      if (scale.is_ready()) { ready = true; break; }
+      delay(1);
+      yield();
+    }
+
+    if (!ready) {
+      // If we haven't collected anything yet, try one-time digital power cycle
+      if (!recoveryTried && got == 0) {
+        recoveryTried = true;
+        Serial.println(F("[HX711] Tare: no data yet, attempting HX711 digital power cycle..."));
+        scale.power_down();
+        delay(2);
+        scale.power_up();
+        delay(450); // allow startup (10SPS)
+        continue;
+      }
+
+      // Fallback: try a short stability-gated RAW capture (internally waits for ready)
+      uint32_t elapsed = millis() - t0;
+      if (elapsed + 500 < overall_timeout_ms) {
+        long zeroRaw = readStableRaw(/*minSamples=*/5, /*maxSamples=*/50, /*maxStdDev=*/2400.0f, /*minDurationMs=*/300);
+        sum += zeroRaw;
+        ++got;
+      }
+      continue;
+    }
+
+    // Read one raw sample (do not scale)
+    long raw = scale.read();
+    sum += raw;
+    ++got;
+  }
+
+  if (got == 0) {
+    Serial.println(F("[HX711] Tare failed: no samples (check VCC/GND, RATE=GND, SCK idle LOW)."));
+    return false;
+  }
+
+  long avg = (long)(sum / got);
+  scale.set_offset(avg);
+  Serial.print(F("[HX711] Tare offset=")); Serial.print(avg);
+  Serial.print(F(" (")); Serial.print(got); Serial.println(F(" samples)"));
+  return true;
 }
 
 void cmdSolve2pt() {
@@ -288,21 +593,9 @@ void cmdSolve2pt() {
   Serial.print(dr); Serial.print(F(" / ")); Serial.print(dm, 3);
   Serial.print(F(" = ")); Serial.println(currentCalFactor, 6);
 
-  float verify_g = scale.get_units(30);
-  float verify_kg = verify_g / 1000.0f;
-  Serial.print(F("[SOLVE] Live reading: ")); Serial.print(verify_kg, 3); Serial.println(F(" kg"));
-  if (calHasP1) {
-    float tgt1_kg = calP1_mass_g / 1000.0f;
-    float err1 = (tgt1_kg != 0.0f) ? (100.0f * (verify_kg - tgt1_kg) / tgt1_kg) : 0.0f;
-    Serial.print(F("[SOLVE] Check vs P1 (")); Serial.print(tgt1_kg, 3); Serial.print(F(" kg): "));
-    Serial.print(err1, 2); Serial.println(F(" %"));
-  }
-  if (calHasP2) {
-    float tgt2_kg = calP2_mass_g / 1000.0f;
-    float err2 = (tgt2_kg != 0.0f) ? (100.0f * (verify_kg - tgt2_kg) / tgt2_kg) : 0.0f;
-    Serial.print(F("[SOLVE] Check vs P2 (")); Serial.print(tgt2_kg, 3); Serial.print(F(" kg): "));
-    Serial.print(err2, 2); Serial.println(F(" %"));
-  }
+  float verify_g = scale.get_units(20);
+  Serial.print(F("[SOLVE] Live reading: "));
+  Serial.print(verify_g / 1000.0f, 3); Serial.println(F(" kg"));
 
   g_calInProgress = false;
   g_pauseUntilMs = millis() + 3000; // 3s cooldown
@@ -387,14 +680,38 @@ void setup() {
 
   // ---- HX711 init ----
   scale.begin(HX711_DOUT, HX711_SCK);
-  if (!scale.is_ready()) {
-    Serial.println(F("[HX711] Not ready at startup (check wiring/power)."));
+  scale.set_gain(128);  // default is 128
+
+  // Ensure HX711 is producing data before taring (retry with digital power cycle)
+  bool ready = false;
+  for (int attempt = 0; attempt < 3; ++attempt) {
+    delay(50); // allow power-up
+    if (scale.is_ready()) { ready = true; break; }
+    // Quick digital power cycle of HX711 core (PD_SCK high >= 60us)
+    scale.power_down();
+    delay(2);
+    scale.power_up();
+    // If RATE=10SPS, first data can take ~400ms; give it time
+    delay(400);
   }
-  // Set calibration factor and tare the empty platform
+
+  if (!ready) {
+    Serial.println(F("[HX711] Not ready after retries (check VCC/GND, RATE pin=GND for 10SPS, SCK idle LOW, wiring)."));
+  }
+
+  // Set calibration factor regardless so subsequent reads use a known scale
   scale.set_scale(CAL_FACTOR);
-  Serial.println(F("[HX711] Taring..."));
-  scale.tare(20); // average 20 readings for tare
-  Serial.println(F("[HX711] Ready."));
+
+  if (ready) {
+    Serial.println(F("[HX711] Taring..."));
+    if (!tareWithTimeout(25, /*per_read_timeout_ms=*/500, /*overall_timeout_ms=*/12000)) {
+      Serial.println(F("[HX711] Tare skipped (timeout)."));
+    } else {
+      Serial.println(F("[HX711] Ready."));
+    }
+  } else {
+    Serial.println(F("[HX711] Skipping tare because ADC not ready."));
+  }
 
   float saved;
   if (loadCal(saved)) {
@@ -494,21 +811,48 @@ void loop() {
   } else {
     switch (g_state) {
       case RunState::IDLE: {
-        if (millis() - lastIdlePoll >= IDLE_POLL_MS) {
-          lastIdlePoll = millis();
-          if (scale.is_ready()) {
-            float g_read = scale.get_units(3); // grams
-            float kg = g_read / 1000.0f;
-            if (fabs(kg) < 0.005f) kg = 0.0f; // ~5 g deadband
-            Serial.print(F("[IDLE] kg=")); Serial.println(kg, 3);
+        // Fixed cadence logger independent of HX711 blocking time
+        static uint32_t nextIdleLogMs = 0;
+        if ((int32_t)(millis() - nextIdleLogMs) >= 0) {
+          nextIdleLogMs += IDLE_POLL_MS;   // schedule next tick first to keep cadence
 
-            if (fabs(kg) >= TRIGGER_KG) {
-              g_buf.clear();
-              session_t0 = millis();
-              below_start_ms = 0;
-              g_state = RunState::ACTIVE;
-              Serial.println(F("[STATE] -> ACTIVE"));
+          // Try a quick, low-latency read: wait up to ~5 ms for ready
+          float kg_now = 0.0f;
+          bool got = false;
+          uint32_t tstart = millis();
+          while ((int32_t)(millis() - tstart) < 5) {
+            if (scale.is_ready()) {
+              float g_read = scale.get_units(1); // single sample to minimize blocking
+              kg_now = g_read / 1000.0f;
+              got = true;
+              break;
             }
+            delay(1);
+          }
+
+          // Simple EMA to avoid jumpy idle prints if we missed a sample
+          static bool emaInit = false;
+          static float idleKgEMA = 0.0f;
+          if (!emaInit) { idleKgEMA = kg_now; emaInit = true; }
+          else { idleKgEMA = 0.9f * idleKgEMA + 0.1f * kg_now; }
+
+          // Small deadband to zero tiny drift
+          if (fabs(idleKgEMA) < 0.005f) idleKgEMA = 0.0f;
+
+          Serial.print(F("[IDLE] kg=")); Serial.println(idleKgEMA, 3);
+
+          // If we fall behind (e.g., long blocking elsewhere), resync the schedule
+          if ((int32_t)(millis() - nextIdleLogMs) > (int32_t)(IDLE_POLL_MS * 5)) {
+            nextIdleLogMs = millis() + IDLE_POLL_MS;
+          }
+
+          // Arm ACTIVE only on clear trigger crossing using the smoothed value
+          if (fabs(idleKgEMA) >= TRIGGER_KG) {
+            g_buf.clear();
+            session_t0 = millis();
+            below_start_ms = 0;
+            g_state = RunState::ACTIVE;
+            Serial.println(F("[STATE] -> ACTIVE"));
           }
         }
         break;
