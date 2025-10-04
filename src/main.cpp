@@ -61,7 +61,14 @@ constexpr float RELEASE_KG = 3.00f;         // lower threshold to exit ACTIVE (h
 // ACTIVE termination
 constexpr uint32_t BELOW_HOLD_MS = 2000;    // need this many ms below HOLD_KG to end ACTIVE
 constexpr uint32_t ACTIVE_MAX_MS = 90000;   // hard cap on ACTIVE session (failsafe, 90s)
+
 constexpr uint32_t DEBUG_EVERY_N = 32;      // log every N samples during ACTIVE
+
+// Re-arm gating to avoid false triggers during settle-to-zero
+constexpr uint32_t POST_ACTIVE_COOLDOWN_MS = 4000; // wait this long after ACTIVE ends
+constexpr float    ARM_BAND_KG             = 1.0f; // must stay within ± this band to re-arm
+constexpr uint32_t ARM_STABLE_MS           = 2500; // and be stable for this long
+constexpr float    RISE_MIN_KG             = 0.20f; // require this minimum rising step to arm (edge trigger)
 
 static uint32_t session_t0 = 0;             // millis() at session start
 static uint32_t below_start_ms = 0;         // timer for below-threshold during ACTIVE
@@ -808,9 +815,16 @@ void loop() {
       Serial.println(F("[STATE] Calibration/cooldown in progress - capture paused"));
       lastMsg = millis();
     }
+    // Ensure arming window is reset during cooldown
+    // (placed inside the heartbeat so it runs without flooding serial)
+    // Note: these are static variables in IDLE scope; we gate with globals here by zeroing the timers when we return to IDLE.
   } else {
     switch (g_state) {
       case RunState::IDLE: {
+        // Re-arm gate state
+        static bool armOk = false;
+        static uint32_t armBelowStartMs = 0;
+        static float prevIdleKgEMA = 0.0f;
         // Fixed cadence logger independent of HX711 blocking time
         static uint32_t nextIdleLogMs = 0;
         if ((int32_t)(millis() - nextIdleLogMs) >= 0) {
@@ -836,23 +850,51 @@ void loop() {
           if (!emaInit) { idleKgEMA = kg_now; emaInit = true; }
           else { idleKgEMA = 0.9f * idleKgEMA + 0.1f * kg_now; }
 
+          // Track stability near zero to allow re-arming only after the platform has settled
+          if (fabs(idleKgEMA) <= ARM_BAND_KG) {
+            if (armBelowStartMs == 0) armBelowStartMs = millis();
+            if (millis() - armBelowStartMs >= ARM_STABLE_MS) armOk = true;
+          } else {
+            armBelowStartMs = 0;
+            // If we drift far from zero again, require a fresh stable window
+            // but keep existing armOk if already earned and not consumed.
+          }
+
+          // Compute short-term rise to enforce edge trigger (avoid re-trigger on decay)
+          float rise = idleKgEMA - prevIdleKgEMA;
+          prevIdleKgEMA = idleKgEMA;
+
           // Small deadband to zero tiny drift
           if (fabs(idleKgEMA) < 0.005f) idleKgEMA = 0.0f;
 
           Serial.print(F("[IDLE] kg=")); Serial.println(idleKgEMA, 3);
+
+          // Debug: show arming status occasionally
+          static uint32_t lastArmDbg = 0;
+          if (millis() - lastArmDbg > 1000) {
+            Serial.print(F("[ARM] ok=")); Serial.print(armOk ? F("1") : F("0"));
+            Serial.print(F(" withinBand=")); Serial.print(fabs(idleKgEMA) <= ARM_BAND_KG ? F("1") : F("0"));
+            Serial.print(F(" rise=")); Serial.println(rise, 3);
+            lastArmDbg = millis();
+          }
 
           // If we fall behind (e.g., long blocking elsewhere), resync the schedule
           if ((int32_t)(millis() - nextIdleLogMs) > (int32_t)(IDLE_POLL_MS * 5)) {
             nextIdleLogMs = millis() + IDLE_POLL_MS;
           }
 
-          // Arm ACTIVE only on clear trigger crossing using the smoothed value
-          if (fabs(idleKgEMA) >= TRIGGER_KG) {
+          // Arm ACTIVE only when:
+          // 1) we've been stable near zero recently (armOk true),
+          // 2) we see a rising edge of at least RISE_MIN_KG,
+          // 3) and the smoothed value crosses the trigger threshold.
+          if (armOk && rise >= RISE_MIN_KG && fabs(idleKgEMA) >= TRIGGER_KG) {
             g_buf.clear();
             session_t0 = millis();
             below_start_ms = 0;
             g_state = RunState::ACTIVE;
-            Serial.println(F("[STATE] -> ACTIVE"));
+            armOk = false;                // consume the arm gate
+            armBelowStartMs = 0;
+            Serial.println(F("[STATE] -> ACTIVE (armed via stable-zero + rising edge)"));
           }
         }
         break;
@@ -880,7 +922,10 @@ void loop() {
               bool ok = postEventToSupabase(g_buf, SCALE_ID);
               Serial.println(ok ? F("[POST] upload OK") : F("[POST] upload FAILED"));
               g_state = RunState::IDLE;
-              Serial.println(F("[STATE] -> IDLE"));
+              // Start a short cooldown and reset re-arm gate; IDLE will re-arm after stability near zero
+              g_pauseUntilMs = millis() + POST_ACTIVE_COOLDOWN_MS;
+              // Do not set armOk here—IDLE will earn it once stable within ARM_BAND_KG for ARM_STABLE_MS
+              Serial.println(F("[STATE] -> IDLE (cooldown started)"));
             }
           } else {
             below_start_ms = 0;
@@ -891,7 +936,8 @@ void loop() {
             bool ok = postEventToSupabase(g_buf, SCALE_ID);
             Serial.println(ok ? F("[POST] upload OK") : F("[POST] upload FAILED"));
             g_state = RunState::IDLE;
-            Serial.println(F("[STATE] -> IDLE"));
+            g_pauseUntilMs = millis() + POST_ACTIVE_COOLDOWN_MS;
+            Serial.println(F("[STATE] -> IDLE (cooldown started)"));
           }
         }
         break;
