@@ -23,27 +23,12 @@ constexpr gpio_num_t LED_PIN = GPIO_NUM_2;      // Onboard blue LED (commonly GP
 WiFiManager wm;  // Global so we can open the portal from loop()
 
 // HX711 load cell setup
-// Wiring per project context: DOUT -> GPIO16, SCK -> GPIO4
+// Wiring per project context: DOUT -> GPIO19, SCK -> GPIO18
 const int HX711_DOUT = 19;   // LOADCELL_DOUT_PIN
 const int HX711_SCK  = 18;    // LOADCELL_SCK_PIN
 const float CAL_FACTOR = 9863.23333f; // calibration factor (project-specific)
 
-
 HX711 scale;                 // HX711 instance
-// Track the last tare/zero offset we applied so we can compute grams directly from RAW
-static volatile long g_lastOffset = 0;
-
-// HX711 24-bit boundaries for saturation check
-inline bool hx711Saturated(long r) {
-  // Common HX711 plateau values depending on library bit-shifts
-  // 0x7FFFFF (8388607) 24-bit max, 0x1FFFFF (2097151) observed in some libs, and -1
-  long ar = labs(r);
-  if (r == -1L) return true;
-  if (ar == 2097151L || ar == 8388607L) return true; // exact full-scale plateaus
-  // Heuristic: anything within the top ~1% of either plateau is also suspect
-  if (ar >= 0.99f * 2097151.0f || ar >= 0.99f * 8388607.0f) return true;
-  return false;
-}
 
 // ===== Supabase ingest (prototype) =====
 // For production, call a Supabase Edge Function with a function secret instead of shipping a service key here.
@@ -240,7 +225,6 @@ void cmdCalibrate(float knownMassGrams) {
                                  /*maxStdDev=*/1200.0f,
                                  /*minDurationMs=*/800);
     scale.set_offset(zeroRaw);
-    g_lastOffset = zeroRaw;
     Serial.print(F("[CAL] Refined zero offset=")); Serial.println(zeroRaw);
   }
   // 2) Ensure we read ~0 g after tare
@@ -460,7 +444,6 @@ void cmdCal1(float grams) {
   {
     long zeroRaw = readStableRaw(20, 120, 1200.0f, 800);
     scale.set_offset(zeroRaw);
-    g_lastOffset = zeroRaw;
     Serial.print(F("[CAL1] Refined zero offset=")); Serial.println(zeroRaw);
   }
   if (!waitStableZeroG(CAL_STABLE_TOL_G, CAL_STABLE_MS, CAL_TIMEOUT_MS)) {
@@ -501,7 +484,6 @@ void cmdCal2(float grams) {
   {
     long zeroRaw = readStableRaw(20, 120, 1200.0f, 800);
     scale.set_offset(zeroRaw);
-    g_lastOffset = zeroRaw;
     Serial.print(F("[CAL2] Refined zero offset=")); Serial.println(zeroRaw);
   }
   if (!waitStableZeroG(CAL_STABLE_TOL_G, CAL_STABLE_MS, CAL_TIMEOUT_MS)) {
@@ -589,7 +571,6 @@ bool tareWithTimeout(uint16_t samples, uint32_t per_read_timeout_ms, uint32_t ov
 
   long avg = (long)(sum / got);
   scale.set_offset(avg);
-  g_lastOffset = avg;
   Serial.print(F("[HX711] Tare offset=")); Serial.print(avg);
   Serial.print(F(" (")); Serial.print(got); Serial.println(F(" samples)"));
   return true;
@@ -734,11 +715,6 @@ void setup() {
       Serial.println(F("[HX711] Tare skipped (timeout)."));
     } else {
       Serial.println(F("[HX711] Ready."));
-      // Keep our local offset tracker in sync after initial tare
-      {
-        long zeroRaw = readStableRaw(5, 40, 2400.0f, 200);
-        g_lastOffset = zeroRaw;
-      }
     }
   } else {
     Serial.println(F("[HX711] Skipping tare because ADC not ready."));
@@ -926,116 +902,18 @@ void loop() {
 
       case RunState::ACTIVE: {
         if (scale.is_ready()) {
-          // Read a raw sample first so we can detect saturation and compute an independent grams estimate
-          long raw = scale.read();
-          if (hx711Saturated(raw)) {
-            // Drop saturated/invalid samples
-            return; // skip this iteration of ACTIVE without advancing timers
-          }
-
-          // Debounce sticky RAW plateaus (identical value repeating many times)
-          static long prevRaw = 0;
-          static uint16_t sameRawCount = 0;
-          if (raw == prevRaw) {
-            if (sameRawCount < 65000) sameRawCount++;
-          } else {
-            sameRawCount = 0;
-          }
-          prevRaw = raw;
-          if (sameRawCount >= 3) {
-            // If RAW is frozen for multiple reads, skip using this sample
-            static uint32_t lastFreezeLog = 0;
-            if (millis() - lastFreezeLog > 1000) {
-              Serial.print(F("[ACTIVE] Dropped frozen RAW=")); Serial.println(raw);
-              lastFreezeLog = millis();
-            }
-            return; // skip this iteration
-          }
-
-          // Path A: library compute (may glitch if internal scale gets corrupted)
-          float g_lib = scale.get_units(1); // grams
-
-          // Path B: manual compute from RAW using our tracked offset and currentCalFactor
-          float g_manual = (float)(raw - g_lastOffset) / (currentCalFactor > 0.001f ? currentCalFactor : CAL_FACTOR);
-
-          // Reject impossible deltas vs lastOffset (e.g., when RAW rails but wasn't caught above)
-          const float MAX_KG_PLAUSIBLE = 200.0f;
-          if (fabsf(g_manual / 1000.0f) > MAX_KG_PLAUSIBLE) {
-            static uint32_t lastImp = 0;
-            if (millis() - lastImp > 1000) {
-              Serial.print(F("[ACTIVE] Dropped implausible manual kg=")); Serial.println(g_manual / 1000.0f, 3);
-              lastImp = millis();
-            }
-            return; // skip storing this sample
-          }
-
-          // Choose between them: if lib reading is implausible, prefer manual
-          float g_use = g_lib;
-          bool lib_bad = isnan(g_lib) || isinf(g_lib) || fabsf(g_lib) > 150000.0f /* >150 kg */ || fabsf(g_lib - g_manual) > 15000.0f /* >15 kg diff */;
-          if (lib_bad) {
-            g_use = g_manual;
-            static uint32_t lastWarn = 0;
-            if (millis() - lastWarn > 1000) {
-              Serial.print(F("[ACTIVE] Lib units glitch. raw=")); Serial.print(raw);
-              Serial.print(F(" g_lib=")); Serial.print(g_lib, 2);
-              Serial.print(F(" g_manual=")); Serial.println(g_manual, 2);
-              lastWarn = millis();
-            }
-          }
-
-          // Convert to kg
-          float kg = g_use / 1000.0f;
-
-          // Soft end watchdog: if we keep dropping samples but their tentative value is low, allow ending
-          static uint16_t lowDropCount = 0;
-          // Compute a tentative kg reading (use the more trusted of lib/manual already chosen below)
-          float tentativeKg = g_manual / 1000.0f; // use manual which is less prone to library glitches
-          if (fabsf(tentativeKg) < RELEASE_KG) {
-            if (lowDropCount < 65000) lowDropCount++;
-          } else {
-            lowDropCount = 0;
-          }
-          if (lowDropCount >= 50) { // ~0.6s at 80SPS or ~5s at 10SPS
-            Serial.println(F("[ACTIVE] ending (soft watchdog); too many low drops"));
-            bool ok = postEventToSupabase(g_buf, SCALE_ID);
-            Serial.println(ok ? F("[POST] upload OK") : F("[POST] upload FAILED"));
-            g_state = RunState::IDLE;
-            g_pauseUntilMs = millis() + POST_ACTIVE_COOLDOWN_MS;
-            Serial.println(F("[STATE] -> IDLE (cooldown started)"));
-            return;
-          }
-
-          // Simple spike filter vs last accepted value (only when both samples are above release band)
-          static bool haveLast = false;
-          static float lastKg = 0.0f;
-          bool lastHigh = haveLast && (fabsf(lastKg) >= RELEASE_KG);
-          bool curHigh  = (fabsf(kg)     >= RELEASE_KG);
-          if (lastHigh && curHigh && fabsf(kg - lastKg) > 25.0f) { // jump >25 kg implausible when both are high
-            static uint32_t lastDrop = 0;
-            if (millis() - lastDrop > 1000) {
-              Serial.print(F("[ACTIVE] Dropped spike kg=")); Serial.print(kg, 3);
-              Serial.print(F(" prev=")); Serial.print(lastKg, 3);
-              Serial.print(F(" raw=")); Serial.println(raw);
-              lastDrop = millis();
-            }
-            return; // skip storing this sample
-          }
-
+          float g_read = scale.get_units(1); // grams
+          float kg = g_read / 1000.0f;
           uint32_t t_rel = millis() - session_t0;
           if (fabs(kg) < 0.005f) kg = 0.0f;
-
           static uint32_t dbgCount = 0;
           if ((dbgCount++ % DEBUG_EVERY_N) == 0) {
             Serial.print(F("[ACTIVE] t(ms)=")); Serial.print(t_rel);
             Serial.print(F(" kg=")); Serial.println(kg, 3);
           }
-
           if (g_buf.size() < MAX_SAMPLES) {
             g_buf.push_back({t_rel, kg});
           }
-
-          lastKg = kg;
-          haveLast = true;
 
           if (fabs(kg) < RELEASE_KG) {
             if (below_start_ms == 0) below_start_ms = millis();
