@@ -173,6 +173,8 @@ constexpr uint32_t CAL_STABLE_MIN_MS = 1500;    // minimum duration for RAW wind
 // --- Calibration helpers ---
 float currentCalFactor = CAL_FACTOR; // track live factor
 String serialLine;
+bool g_invertSign = true; // set true to invert A+/A- wiring in software
+float readGrams(int samples = 1);
 
 void printHelp();
 void cmdCalibrate(float knownMassGrams);
@@ -212,23 +214,30 @@ void cmdCalibrate(float knownMassGrams) {
   g_state = RunState::IDLE;
   below_start_ms = 0;
   g_buf.clear();
+  // Silence Wi‑Fi during calibration to reduce noise on HX711
+  auto prevWifiMode = WiFi.getMode();
+  WiFi.mode(WIFI_OFF);
 
   // 1) Tare
   Serial.println(F("[CAL] Empty platform then taring..."));
   if (!tareWithTimeout(25, /*per_read_timeout_ms=*/500, /*overall_timeout_ms=*/12000)) {
+    // Restore Wi‑Fi before exiting
+    WiFi.mode(prevWifiMode);
+    if (prevWifiMode == WIFI_STA) { WiFi.reconnect(); }
     g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
   }
   // Refine zero offset using a short stable raw window, independent of scale factor
-  {
-    long zeroRaw = readStableRaw(/*minSamples=*/20,
-                                 /*maxSamples=*/120,
-                                 /*maxStdDev=*/1200.0f,
-                                 /*minDurationMs=*/800);
-    scale.set_offset(zeroRaw);
-    Serial.print(F("[CAL] Refined zero offset=")); Serial.println(zeroRaw);
-  }
+  long zeroRaw = readStableRaw(/*minSamples=*/20,
+                               /*maxSamples=*/120,
+                               /*maxStdDev=*/1200.0f,
+                               /*minDurationMs=*/800);
+  scale.set_offset(zeroRaw);
+  Serial.print(F("[CAL] Refined zero offset=")); Serial.println(zeroRaw);
   // 2) Ensure we read ~0 g after tare
   if (!waitStableZeroG(CAL_STABLE_TOL_G, CAL_STABLE_MS, CAL_TIMEOUT_MS)) {
+    // Restore Wi‑Fi before exiting
+    WiFi.mode(prevWifiMode);
+    if (prevWifiMode == WIFI_STA) { WiFi.reconnect(); }
     g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
   }
 
@@ -238,6 +247,9 @@ void cmdCalibrate(float knownMassGrams) {
   Serial.println(F("[CAL] Waiting for stable plateau..."));
   long plateauMean = 0;
   if (!waitStableRawPlateau(/*window_ms=*/1200, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/2000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateauMean)) {
+    // Restore Wi‑Fi before exiting
+    WiFi.mode(prevWifiMode);
+    if (prevWifiMode == WIFI_STA) { WiFi.reconnect(); }
     g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
   }
 
@@ -246,13 +258,25 @@ void cmdCalibrate(float knownMassGrams) {
                            /*maxSamples=*/CAL_MAX_SAMPLES,
                            /*maxStdDev=*/CAL_MAX_SD_COUNTS,
                            /*minDurationMs=*/CAL_STABLE_MIN_MS);
+  long delta = raw - zeroRaw;
+  if (labs(delta) < 20000) { // require at least ~20k counts swing vs zero
+    Serial.print(F("[CAL] ERROR: negligible delta vs zero ("));
+    Serial.print(delta);
+    Serial.println(F(" counts). Check RATE=GND (10SPS), HX711 VCC=3.3V, A+/A- wiring, and platform stability. Aborting."));
+    // Restore Wi‑Fi before exiting
+    WiFi.mode(prevWifiMode);
+    if (prevWifiMode == WIFI_STA) { WiFi.reconnect(); }
+    g_calInProgress = false;
+    g_pauseUntilMs = millis() + 3000;
+    return;
+  }
   float newFactor = raw / knownMassGrams; // counts per gram
   scale.set_scale(newFactor);
   currentCalFactor = newFactor;
   saveCal(newFactor);
 
   // 5) Verify
-  float check_g = scale.get_units(30);
+  float check_g = readGrams(30);
   float check_kg = check_g / 1000.0f;
   Serial.print(F("[CAL] raw=")); Serial.print(raw);
   Serial.print(F(" counts @ mass=")); Serial.print(knownMassGrams, 1); Serial.println(F(" g"));
@@ -262,8 +286,17 @@ void cmdCalibrate(float knownMassGrams) {
   float pct_err = (expect_kg != 0.0f) ? (100.0f * (check_kg - expect_kg) / expect_kg) : 0.0f;
   Serial.print(F("[CAL] Error vs target: ")); Serial.print(pct_err, 2); Serial.println(F(" %"));
   Serial.println(F("[CAL] Saved to NVS. Persists across reboots."));
+  Serial.println(F("[CAL] Saved to NVS. Persists across reboots."));
+  // Restore Wi‑Fi now that calibration reads are finished
+  WiFi.mode(prevWifiMode);
+  if (prevWifiMode == WIFI_STA) { WiFi.reconnect(); }
   g_calInProgress = false;
   g_pauseUntilMs = millis() + 3000; // 3s cooldown after calibration
+}
+// Helper that applies sign inversion to gram reads if A+/A- are flipped
+float readGrams(int samples) {
+  float g = scale.get_units(samples);
+  return g_invertSign ? -g : g;
 }
 // ---- Time-window samplers ----
 // Collect grams over a fixed time window; returns number of samples and outputs mean/sd
@@ -275,7 +308,7 @@ uint16_t sampleGramsFor(uint32_t window_ms, uint16_t max_samples, float &mean_ou
   uint32_t t0 = millis();
   while ((int32_t)(millis() - t0) < (int32_t)window_ms) {
     if (scale.wait_ready_timeout(10)) {
-      float g = scale.get_units(1); // 1-sample convert to grams using current factor
+      float g = readGrams(1); // apply optional sign inversion
       if (n < max_samples) buf[n++] = g;
     } else {
       // no sample in this 10ms slice; let WiFi/Serial run
@@ -513,6 +546,7 @@ bool tareWithTimeout(uint16_t samples, uint32_t per_read_timeout_ms, uint32_t ov
   // Ensure SCK is driven LOW before we start (HX711 requires PD_SCK low during conversions)
   pinMode(HX711_SCK, OUTPUT);
   digitalWrite(HX711_SCK, LOW);
+  // (Recommend 10k pulldown on HX711 SCK at the board to ensure idle LOW even during boot/Wi‑Fi bursts)
 
   uint32_t t0 = millis();
   uint16_t got = 0;
@@ -600,7 +634,7 @@ void cmdSolve2pt() {
   Serial.print(dr); Serial.print(F(" / ")); Serial.print(dm, 3);
   Serial.print(F(" = ")); Serial.println(currentCalFactor, 6);
 
-  float verify_g = scale.get_units(20);
+  float verify_g = readGrams(20);
   Serial.print(F("[SOLVE] Live reading: "));
   Serial.print(verify_g / 1000.0f, 3); Serial.println(F(" kg"));
 
@@ -684,6 +718,10 @@ void setup() {
   pinMode(BOOT_BTN, INPUT_PULLUP);  // BOOT is pulled up; pressed = LOW
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW); // off initially
+
+  pinMode(HX711_DOUT, INPUT);
+  pinMode(HX711_SCK,  OUTPUT);
+  digitalWrite(HX711_SCK, LOW);
 
   // ---- HX711 init ----
   scale.begin(HX711_DOUT, HX711_SCK);
@@ -836,7 +874,7 @@ void loop() {
           uint32_t tstart = millis();
           while ((int32_t)(millis() - tstart) < 5) {
             if (scale.is_ready()) {
-              float g_read = scale.get_units(1); // single sample to minimize blocking
+              float g_read = readGrams(1); // apply optional sign inversion
               kg_now = g_read / 1000.0f;
               got = true;
               break;
@@ -902,7 +940,7 @@ void loop() {
 
       case RunState::ACTIVE: {
         if (scale.is_ready()) {
-          float g_read = scale.get_units(1); // grams
+          float g_read = readGrams(1); // grams (with optional sign inversion)
           float kg = g_read / 1000.0f;
           uint32_t t_rel = millis() - session_t0;
           if (fabs(kg) < 0.005f) kg = 0.0f;
