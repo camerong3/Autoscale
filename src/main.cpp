@@ -167,13 +167,13 @@ constexpr uint32_t CAL_TIMEOUT_MS     = 60000;  // overall wait timeout per step
 // ---- Calibration raw-window tuning (counts-based) ----
 constexpr uint16_t CAL_MIN_SAMPLES   = 30;      // minimum samples in stable RAW window
 constexpr uint16_t CAL_MAX_SAMPLES   = 400;     // cap samples collected during RAW window
-constexpr float    CAL_MAX_SD_COUNTS = 5000.0f;  // standard deviation threshold (counts)
-constexpr uint32_t CAL_STABLE_MIN_MS = 1500;    // minimum duration for RAW window
+constexpr float    CAL_MAX_SD_COUNTS = 1500.0f;  // stricter SD threshold (counts)
+constexpr uint32_t CAL_STABLE_MIN_MS = 2500;     // longer RAW window duration (ms)
 
 // --- Calibration helpers ---
 float currentCalFactor = CAL_FACTOR; // track live factor
 String serialLine;
-bool g_invertSign = true; // set true to invert A+/A- wiring in software
+bool g_invertSign = false; // set true to invert A+/A- wiring in software
 float readGrams(int samples = 1);
 
 void printHelp();
@@ -182,6 +182,8 @@ void cmdTare();
 void cmdCal1(float grams);
 void cmdCal2(float grams);
 void cmdSolve2pt();
+void cmdSckHold(uint16_t seconds);
+void cmdProbeSPS(uint16_t seconds);
 void printHelp() {
   Serial.println(F("\n[CMD] Commands:"));
   Serial.println(F("  help              - show this help"));
@@ -191,7 +193,76 @@ void printHelp() {
   Serial.println(F("  cal2 <g>          - two-point: record point 2 at <g>"));
   Serial.println(F("  solve             - solve two-point factor from cal1/cal2"));
   Serial.println(F("  resetcal          - reset calibration to default factor"));
+  Serial.println(F("  sps [s]          - measure HX711 sample rate (~10 or ~80 SPS)"));
   Serial.println(F("Units: readings print in kilograms (kg)."));
+}
+// Hold HX711 SCK high for N seconds (for testing powerdown)
+void cmdSckHold(uint16_t seconds) {
+  if (seconds == 0) seconds = 2;
+  Serial.print(F("[HX711] Holding SCK HIGH for ")); Serial.print(seconds); Serial.println(F(" s"));
+  pinMode(HX711_SCK, OUTPUT);
+  digitalWrite(HX711_SCK, HIGH);
+  delay(seconds * 1000UL);
+  digitalWrite(HX711_SCK, LOW);
+  Serial.println(F("[HX711] SCK released LOW"));
+}
+
+// Probe HX711 sample rate (SPS) by timing successive conversions
+void cmdProbeSPS(uint16_t seconds) {
+  if (seconds == 0) seconds = 3;
+  Serial.print(F("[SPS] Probing HX711 rate for ")); Serial.print(seconds); Serial.println(F(" s"));
+
+  // Pause normal operation
+  g_calInProgress = true;
+  g_state = RunState::IDLE;
+  g_pauseUntilMs = millis() + (seconds * 1000UL);
+
+  // Make sure SCK starts LOW
+  pinMode(HX711_SCK, OUTPUT);
+  digitalWrite(HX711_SCK, LOW);
+
+  const uint32_t t_end = millis() + (seconds * 1000UL);
+  const uint16_t MAXN = 800; // enough for 80SPS * 10s
+  static uint16_t n;
+  static uint32_t ts[MAXN];
+  n = 0;
+
+  // Prime: wait for first ready and read one sample
+  while (!scale.is_ready()) { delay(1); }
+  uint32_t t_prev = millis();
+  (void)scale.read(); // clock out to start next conversion
+
+  while ((int32_t)(millis() - t_end) < 0 && n < (MAXN-1)) {
+    // Wait until data ready again, then timestamp and read to release DRDY
+    while (!scale.is_ready()) { delay(1); }
+    uint32_t t_now = millis();
+    ts[n++] = t_now - t_prev; // inter-conversion period in ms
+    t_prev = t_now;
+    (void)scale.read();
+  }
+
+  if (n == 0) {
+    Serial.println(F("[SPS] No samples captured. Check wiring/power."));
+  } else {
+    // Compute stats
+    uint32_t minv = 0xFFFFFFFF, maxv = 0; uint64_t sum = 0; 
+    for (uint16_t i=0;i<n;i++){ uint32_t v=ts[i]; if(v<minv)minv=v; if(v>maxv)maxv=v; sum+=v; }
+    double mean = (double)sum / n;
+    double acc = 0.0; for(uint16_t i=0;i<n;i++){ double d = ts[i]-mean; acc += d*d; }
+    double sd = (n>1) ? sqrt(acc/(n-1)) : 0.0;
+    double sps = (mean>0.0) ? 1000.0/mean : 0.0;
+
+    Serial.print(F("[SPS] n=")); Serial.print(n);
+    Serial.print(F(" mean period=")); Serial.print(mean, 2); Serial.print(F(" ms (~")); Serial.print(sps, 2); Serial.println(F(" SPS)"));
+    Serial.print(F("[SPS] min=")); Serial.print(minv); Serial.print(F(" ms  max=")); Serial.print(maxv);
+    Serial.print(F(" ms  sd=")); Serial.println(sd, 2);
+
+    if (sps > 40.0) Serial.println(F("[SPS] Looks like 80 SPS -> RATE pin likely HIGH/floating. Tie RATE to GND for 10 SPS."));
+    else if (sps > 0.0) Serial.println(F("[SPS] Looks like ~10 SPS -> RATE pin grounded (good)."));
+  }
+
+  g_calInProgress = false;
+  Serial.println(F("[SPS] Probe complete."));
 }
 
 void cmdTare() {
@@ -246,17 +317,19 @@ void cmdCalibrate(float knownMassGrams) {
   delay(5000); // give user time to place mass
   Serial.println(F("[CAL] Waiting for stable plateau..."));
   long plateauMean = 0;
-  if (!waitStableRawPlateau(/*window_ms=*/1200, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/2000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateauMean)) {
+  if (!waitStableRawPlateau(/*window_ms=*/1500, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/3000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateauMean)) {
     // Restore Wi‑Fi before exiting
     WiFi.mode(prevWifiMode);
     if (prevWifiMode == WIFI_STA) { WiFi.reconnect(); }
     g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
   }
+  // Extra settle time to reduce mechanical creep after plateau detection
+  delay(1500);
 
   // 4) Capture stable RAW counts window (strict) and compute factor
   long raw = readStableRaw(/*minSamples=*/CAL_MIN_SAMPLES,
                            /*maxSamples=*/CAL_MAX_SAMPLES,
-                           /*maxStdDev=*/CAL_MAX_SD_COUNTS,
+                           /*maxStdDev=*/1200.0f,
                            /*minDurationMs=*/CAL_STABLE_MIN_MS);
   long delta = raw - zeroRaw;
   if (labs(delta) < 20000) { // require at least ~20k counts swing vs zero
@@ -270,16 +343,17 @@ void cmdCalibrate(float knownMassGrams) {
     g_pauseUntilMs = millis() + 3000;
     return;
   }
-  float newFactor = raw / knownMassGrams; // counts per gram
+  float newFactor = (float)delta / knownMassGrams; // counts per gram (use delta vs zero)
   scale.set_scale(newFactor);
   currentCalFactor = newFactor;
   saveCal(newFactor);
 
   // 5) Verify
-  float check_g = readGrams(30);
+  float check_g = readGrams(50);
   float check_kg = check_g / 1000.0f;
   Serial.print(F("[CAL] raw=")); Serial.print(raw);
-  Serial.print(F(" counts @ mass=")); Serial.print(knownMassGrams, 1); Serial.println(F(" g"));
+  Serial.print(F(" counts (delta=")); Serial.print(delta);
+  Serial.print(F(") @ mass=")); Serial.print(knownMassGrams, 1); Serial.println(F(" g"));
   Serial.print(F("[CAL] New factor (counts/gram): ")); Serial.println(currentCalFactor, 6);
   Serial.print(F("[CAL] Measured now: ")); Serial.print(check_kg, 3); Serial.println(F(" kg"));
   float expect_kg = knownMassGrams / 1000.0f;
@@ -486,12 +560,14 @@ void cmdCal1(float grams) {
   // Prompt and wait for stable plateau (RAW-based)
   Serial.print(F("[CAL1] Place mass (")); Serial.print(grams, 0); Serial.println(F(" g) and keep still…"));
   long plateau1 = 0;
-  if (!waitStableRawPlateau(/*window_ms=*/1200, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/2000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateau1)) {
+  if (!waitStableRawPlateau(/*window_ms=*/1500, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/3000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateau1)) {
     g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
   }
+  // Extra settle time to reduce mechanical creep after plateau detection
+  delay(1500);
 
   // Capture RAW for better slope calculation
-  calP1_raw = readStableRaw(CAL_MIN_SAMPLES, CAL_MAX_SAMPLES, CAL_MAX_SD_COUNTS, CAL_STABLE_MIN_MS);
+  calP1_raw = readStableRaw(CAL_MIN_SAMPLES, CAL_MAX_SAMPLES, 1200.0f, CAL_STABLE_MIN_MS);
   calP1_mass_g = grams;
   calHasP1 = true;
   Serial.print(F("[CAL1] raw=")); Serial.print(calP1_raw);
@@ -526,12 +602,14 @@ void cmdCal2(float grams) {
   // Prompt and wait for stable plateau (RAW-based)
   Serial.print(F("[CAL2] Place second mass (")); Serial.print(grams, 0); Serial.println(F(" g) and keep still…"));
   long plateau2 = 0;
-  if (!waitStableRawPlateau(/*window_ms=*/1200, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/2000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateau2)) {
+  if (!waitStableRawPlateau(/*window_ms=*/1500, /*maxSdCounts=*/CAL_MAX_SD_COUNTS, /*stable_ms=*/3000, /*timeout_ms=*/CAL_TIMEOUT_MS, plateau2)) {
     g_calInProgress = false; g_pauseUntilMs = millis() + 3000; return;
   }
+  // Extra settle time to reduce mechanical creep after plateau detection
+  delay(1500);
 
   // Capture RAW for better slope calculation
-  calP2_raw = readStableRaw(CAL_MIN_SAMPLES, CAL_MAX_SAMPLES, CAL_MAX_SD_COUNTS, CAL_STABLE_MIN_MS);
+  calP2_raw = readStableRaw(CAL_MIN_SAMPLES, CAL_MAX_SAMPLES, 1200.0f, CAL_STABLE_MIN_MS);
   calP2_mass_g = grams;
   calHasP2 = true;
   Serial.print(F("[CAL2] raw=")); Serial.print(calP2_raw);
@@ -831,6 +909,15 @@ void loop() {
           Serial.println(F("[CMD] Usage: cal <grams> (e.g., cal 500)"));
         } else if (serialLine.equalsIgnoreCase("resetcal")) {
           cmdResetCal();
+        } else if (serialLine.startsWith("sps")) {
+          // Usage: sps [seconds]
+          uint16_t secs = 3;
+          int sp = serialLine.indexOf(' ');
+          if (sp > 0) {
+            secs = (uint16_t)serialLine.substring(sp + 1).toInt();
+            if (secs == 0) secs = 3;
+          }
+          cmdProbeSPS(secs);
         } else {
           Serial.print(F("[CMD] Unknown: ")); Serial.println(serialLine);
           printHelp();
